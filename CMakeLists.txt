@@ -30,6 +30,36 @@ option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
 find_package(OpenMP)
 find_package(Threads REQUIRED)
 
+# Apple Clang does not advertise -fopenmp, so find_package(OpenMP) fails on macOS and
+# the build silently loses all threading (single-core, ~N× slower). Homebrew's libomp
+# supplies the runtime; wire it up by hand exactly as the Makefile does, and surface it
+# through the OpenMP::OpenMP_C target so the rest of the file is unchanged. Without this
+# every macOS CMake build and every bench_kernels number is single-threaded.
+if(NOT OpenMP_C_FOUND AND APPLE)
+  find_program(BREW_EXECUTABLE brew)
+  if(BREW_EXECUTABLE)
+    execute_process(COMMAND ${BREW_EXECUTABLE} --prefix libomp
+                    OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+  endif()
+  if(LIBOMP_PREFIX AND EXISTS "${LIBOMP_PREFIX}/lib/libomp.dylib")
+    add_library(OpenMP::OpenMP_C INTERFACE IMPORTED)
+    set_target_properties(OpenMP::OpenMP_C PROPERTIES
+      INTERFACE_COMPILE_OPTIONS "-Xpreprocessor;-fopenmp"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBOMP_PREFIX}/include"
+      INTERFACE_LINK_LIBRARIES "${LIBOMP_PREFIX}/lib/libomp.dylib")
+    set(OpenMP_C_FOUND TRUE)
+    message(STATUS "OpenMP: using Homebrew libomp at ${LIBOMP_PREFIX} (Apple Clang fallback)")
+  else()
+    message(WARNING "OpenMP not found and libomp missing; the build will be SINGLE-THREADED. brew install libomp")
+  endif()
+endif()
+
+# ---- Architecture detection (ARM NEON vs x86 AVX2) ----
+set(K3_ARCH_NEON OFF CACHE BOOL "Enable ARM NEON SIMD paths")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+  set(K3_ARCH_NEON ON)
+endif()
+
 add_library(k3_flags INTERFACE)
 target_compile_options(k3_flags INTERFACE
   -Wall -Wextra
@@ -42,7 +72,16 @@ target_compile_options(k3_flags INTERFACE
   # contraction; the op tests compare against a reference at a fixed tolerance.
   -ffp-contract=off)
 
-if(K3_NATIVE_ARCH)
+if(K3_ARCH_NEON)
+  # NO -ffast-math: it enables -funsafe-math-optimizations (FP reassociation,
+  # contraction, no-signed-zeros), which reorders reductions and breaks the
+  # engine's bit-exact reproducibility -- the oracle gates require EXACT token
+  # match, not tolerance. See adr/ADR-001. -ffp-contract=off above is kept for
+  # the same reason. armv8-a is the M1 baseline (C-1); +fp16 and +dotprod expose
+  # the half-precision and SDOT/UDOT paths the MXFP4/int8 matmul kernels will use.
+  target_compile_options(k3_flags INTERFACE -march=armv8-a+fp16+dotprod)
+  target_compile_definitions(k3_flags INTERFACE K3_ENABLE_ARM_NEON)
+elseif(K3_NATIVE_ARCH)
   target_compile_options(k3_flags INTERFACE -march=native)
 else()
   # Documented baseline. The engine assumes AVX2 + FMA are available.
