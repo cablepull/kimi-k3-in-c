@@ -14,4 +14,4 @@ Build (needs no metal shader compiler, only the frameworks):
         -framework Metal -framework MetalPerformanceShaders -framework Foundation
 
 Result on M5 Max: GPU ~1.2x the tuned 16-thread CPU matmul (bandwidth-bound GEMV),
-and NOT bit-exact (max rel diff 1.35e-3). The token is I/O-bound anyway. Not worth a port.
+and NOT bit-exact (max rel diff 1.35e-3). The token is I/O-bound anyway. Not worth a port for single-stream decode; but GPU is 10-200x for GEMM (prefill/batched serving) -- see ADR-006 crossover table.

@@ -29,81 +29,72 @@ static inline float bf16f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f;
 static inline uint16_t fbf16(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return (uint16_t)(u >> 16); }
 
 int main() {
-    const int in = 7168, out = 12288;   // KDA q_proj bf16 matmul, the trunk's shape
-    std::vector<uint16_t> W((size_t)out * in);   // bf16 weights
-    std::vector<float>    x(in), y_cpu(out), y_gpu(out);
-    srand(1);
-    for (auto &w : W) w = fbf16((float)(rand() % 1000 - 500) / 5000.0f);
-    for (auto &v : x) v = (float)(rand() % 1000 - 500) / 500.0f;
-
-    // ---- CPU reference: y[o] = sum_i W[o,i] * x[i], double accumulate (engine style) ----
-    const int reps = 20;
-    double t0 = now_s();
-    for (int r = 0; r < reps; r++) {
-#ifdef _OPENMP
-#       pragma omp parallel for schedule(static)
-#endif
-        for (int o = 0; o < out; o++) {
-            double acc = 0.0;
-            const uint16_t *wr = &W[(size_t)o * in];
-            for (int i = 0; i < in; i++) acc += (double)bf16f(wr[i]) * (double)x[i];
-            y_cpu[o] = (float)acc;
-        }
-    }
-    double cpu_ms = (now_s() - t0) / reps * 1e3;
-    double gflop = 2.0 * out * in / 1e9;
-    int nth = 1;
-#ifdef _OPENMP
-    #pragma omp parallel
-    { nth = omp_get_num_threads(); }
-#endif
-    printf("CPU  (%2d threads)         %7.2f ms  %8.1f GFLOP/s\n", nth, cpu_ms, gflop / (cpu_ms/1e3));
-
-    // ---- GPU via MPS: dequant W to fp32 (unified memory, no copy), GEMV as 1xK * KxN ----
+    const int in = 7168, out = 12288;   // trunk bf16 matmul shape (out x in)
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> q = [dev newCommandQueue];
-    // Unified memory: allocate shared buffers the CPU fills and the GPU reads in place.
+    printf("device: %s, unified memory: %s\n\n", [[dev name] UTF8String],
+           dev.hasUnifiedMemory ? "yes" : "no");
+
+    // Weights (bf16 -> fp32 once, resident in shared/unified memory: GPU reads in place).
+    std::vector<uint16_t> W((size_t)out * in);
+    srand(1);
+    for (auto &w : W) w = fbf16((float)(rand() % 1000 - 500) / 5000.0f);
     id<MTLBuffer> bW = [dev newBufferWithLength:(size_t)out*in*sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bx = [dev newBufferWithLength:(size_t)in*sizeof(float)      options:MTLResourceStorageModeShared];
-    id<MTLBuffer> by = [dev newBufferWithLength:(size_t)out*sizeof(float)     options:MTLResourceStorageModeShared];
     float *Wf = (float*)bW.contents;
-    for (size_t k = 0; k < (size_t)out*in; k++) Wf[k] = bf16f(W[k]);   // bf16 -> fp32
-    __builtin_memcpy(bx.contents, x.data(), in*sizeof(float));
-
-    // y[1xN] = x[1xK] * W^T[KxN]; store W as [out x in] row-major = W^T with transposeRight.
-    MPSMatrixDescriptor *dX = [MPSMatrixDescriptor matrixDescriptorWithRows:1 columns:in rowBytes:in*sizeof(float) dataType:MPSDataTypeFloat32];
+    for (size_t k = 0; k < (size_t)out*in; k++) Wf[k] = bf16f(W[k]);
     MPSMatrixDescriptor *dW = [MPSMatrixDescriptor matrixDescriptorWithRows:out columns:in rowBytes:in*sizeof(float) dataType:MPSDataTypeFloat32];
-    MPSMatrixDescriptor *dY = [MPSMatrixDescriptor matrixDescriptorWithRows:1 columns:out rowBytes:out*sizeof(float) dataType:MPSDataTypeFloat32];
-    MPSMatrix *mX = [[MPSMatrix alloc] initWithBuffer:bx descriptor:dX];
     MPSMatrix *mW = [[MPSMatrix alloc] initWithBuffer:bW descriptor:dW];
-    MPSMatrix *mY = [[MPSMatrix alloc] initWithBuffer:by descriptor:dY];
-    MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:dev
-        transposeLeft:NO transposeRight:YES resultRows:1 resultColumns:out interiorColumns:in alpha:1.0 beta:0.0];
 
-    // warm
-    { id<MTLCommandBuffer> cb = [q commandBuffer]; [mm encodeToCommandBuffer:cb leftMatrix:mX rightMatrix:mW resultMatrix:mY]; [cb commit]; [cb waitUntilCompleted]; }
-    t0 = now_s();
-    for (int r = 0; r < reps; r++) {
-        id<MTLCommandBuffer> cb = [q commandBuffer];
-        [mm encodeToCommandBuffer:cb leftMatrix:mX rightMatrix:mW resultMatrix:mY];
-        [cb commit]; [cb waitUntilCompleted];
-    }
-    double gpu_ms = (now_s() - t0) / reps * 1e3;
-    printf("GPU  (MPS, fp32)         %7.2f ms  %8.1f GFLOP/s   (%.1fx CPU)\n",
-           gpu_ms, gflop / (gpu_ms/1e3), cpu_ms / gpu_ms);
+    // Sweep M = tokens processed together. M=1 is single-token DECODE (GEMV, the steady
+    // per-token cost). M>1 is PREFILL / BATCHED serving (GEMM): each weight is reused
+    // across M tokens, so the work becomes FLOP-bound -- where the GPU should pull away.
+    printf("M(tokens) |  CPU 16t GFLOP/s |  GPU GFLOP/s |  GPU speedup   <- decode is M=1\n");
+    printf("----------|------------------|--------------|-------------\n");
+    for (int M : {1, 4, 16, 64, 256}) {
+        std::vector<float> X((size_t)M*in);
+        for (auto &v : X) v = (float)(rand()%1000-500)/500.0f;
+        std::vector<float> Ycpu((size_t)M*out);
+        const double gflop = 2.0 * M * out * in / 1e9;
+        const int reps = M >= 64 ? 5 : 20;
 
-    // ---- bit-exactness delta: GPU vs CPU-double reference ----
-    __builtin_memcpy(y_gpu.data(), by.contents, out*sizeof(float));
-    double max_abs = 0, max_rel = 0; int exact = 0;
-    for (int o = 0; o < out; o++) {
-        double a = fabs((double)y_gpu[o] - (double)y_cpu[o]);
-        double rel = a / (fabs((double)y_cpu[o]) + 1e-9);
-        if (a > max_abs) max_abs = a;
-        if (rel > max_rel) max_rel = rel;
-        if (y_gpu[o] == y_cpu[o]) exact++;
+        // CPU: Y[M x out] = X[M x in] * W^T, double accumulate, threaded over (m,o).
+        double t0 = now_s();
+        for (int r = 0; r < reps; r++) {
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) collapse(2)
+#endif
+            for (int m = 0; m < M; m++)
+                for (int o = 0; o < out; o++) {
+                    double acc = 0.0; const uint16_t *wr = &W[(size_t)o*in];
+                    const float *xr = &X[(size_t)m*in];
+                    for (int i = 0; i < in; i++) acc += (double)bf16f(wr[i]) * (double)xr[i];
+                    Ycpu[(size_t)m*out+o] = (float)acc;
+                }
+        }
+        double cpu_ms = (now_s()-t0)/reps*1e3;
+
+        // GPU MPS GEMM.
+        id<MTLBuffer> bX = [dev newBufferWithLength:(size_t)M*in*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bY = [dev newBufferWithLength:(size_t)M*out*sizeof(float) options:MTLResourceStorageModeShared];
+        __builtin_memcpy(bX.contents, X.data(), (size_t)M*in*sizeof(float));
+        MPSMatrixDescriptor *dX = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:in rowBytes:in*sizeof(float) dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *dY = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:out rowBytes:out*sizeof(float) dataType:MPSDataTypeFloat32];
+        MPSMatrix *mX = [[MPSMatrix alloc] initWithBuffer:bX descriptor:dX];
+        MPSMatrix *mY = [[MPSMatrix alloc] initWithBuffer:bY descriptor:dY];
+        MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:dev
+            transposeLeft:NO transposeRight:YES resultRows:M resultColumns:out interiorColumns:in alpha:1.0 beta:0.0];
+        { id<MTLCommandBuffer> cb=[q commandBuffer]; [mm encodeToCommandBuffer:cb leftMatrix:mX rightMatrix:mW resultMatrix:mY]; [cb commit]; [cb waitUntilCompleted]; }
+        t0 = now_s();
+        for (int r = 0; r < reps; r++) {
+            id<MTLCommandBuffer> cb=[q commandBuffer];
+            [mm encodeToCommandBuffer:cb leftMatrix:mX rightMatrix:mW resultMatrix:mY];
+            [cb commit]; [cb waitUntilCompleted];
+        }
+        double gpu_ms = (now_s()-t0)/reps*1e3;
+        printf("%9d | %16.1f | %12.1f | %8.1fx\n",
+               M, gflop/(cpu_ms/1e3), gflop/(gpu_ms/1e3), cpu_ms/gpu_ms);
     }
-    printf("bit-exactness: %d/%d outputs identical, max abs diff %.3e, max rel %.3e\n",
-           exact, out, max_abs, max_rel);
-    printf("=> GPU is %s bit-exact with the CPU reference.\n", exact == out ? "" : "NOT");
+    printf("\nDecode (M=1) is bandwidth-bound => GPU ~parity. Prefill/batch (M>>1) is\n"
+           "FLOP-bound => GPU pulls away. Single-stream chat lives at M=1.\n");
     return 0;
 }

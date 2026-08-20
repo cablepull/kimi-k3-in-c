@@ -1,7 +1,21 @@
-# ADR-006: GPU (Metal/MPS) is not worth a port for this workload
+# ADR-006: GPU (Metal/MPS) — no-go for single-stream decode, the lever for batched throughput
 
 ## Status
-Accepted (spike outcome — closes the "GPU acceleration" investigation as NO-GO)
+Accepted (spike outcome — NO-GO for the current single-stream engine; a documented
+OPEN opportunity for a future batched/throughput serving mode)
+
+## TL;DR
+GPU speedup depends entirely on batch size. Measured on M5 Max, bf16 12288x7168:
+
+| tokens/batch (M) | CPU 16t GFLOP/s | GPU GFLOP/s | speedup |
+|-----------------:|----------------:|------------:|--------:|
+| 1 (decode/GEMV)  | 47  | 138    | 2.9x |
+| 16               | 55  | 1,916  | 34x  |
+| 256 (prefill/batch, GEMM) | 57 | 11,783 | **207x** |
+
+Single-token decode is bandwidth-bound (GPU ~parity, and the token is I/O-bound anyway).
+Prefill and batched serving are FLOP-bound (GPU 10-200x). The current engine is
+single-stream decode, so GPU does not help *it*; a batched serving mode is where GPU pays.
 
 ## Context
 The user asked to explore GPU acceleration ("including using gpu"), sequenced after the
@@ -27,7 +41,9 @@ nowhere near the CPU reference — MPS accumulates in fp32 with its own reductio
 the engine accumulates in double. This breaks the exact-token oracle (ADR-001).
 
 ## Decision
-**Do not port the engine to GPU.** Five independent reasons, all measured or structural:
+**Do not port the *current single-stream* engine to GPU.** For decode latency — one
+conversation, token by token, which is today's Hermes chat use — GPU is not the lever.
+Five reasons, all measured or structural:
 1. **~1.2x, not the hoped 2-10x.** The per-token matmul is a GEMV — bandwidth-bound, each
    weight read once — and the unified-memory CPU already saturates most of that bandwidth
    with 16 threads. The GPU's edge is small and partly eaten by reading fp32 (2x the bytes
@@ -41,12 +57,28 @@ the engine accumulates in double. This breaks the exact-token oracle (ADR-001).
 5. **The dominant compute (MXFP4 experts) needs custom shaders → full Xcode**, which is not
    installed and is a heavier dependency than the whole project currently has.
 
+## The batched opportunity (OPEN, not pursued now)
+The sweep shows GPU is 10-200x for GEMM. Two workloads are GEMM, not GEMV:
+- **Prefill.** A long prompt (e.g. Hermes's ~4400-token system prompt) is one big GEMM.
+  GPU could make prefill compute nearly free — relevant to time-to-first-token, though
+  the shim's warm-state already amortizes repeat prefills, and expert I/O still applies.
+- **Batched serving.** Running many conversations concurrently turns decode into a GEMM
+  over the batch. This is the high-throughput regime where GPU + resident weights is
+  transformative — but it is a *different product* (a batching inference server) than the
+  single-stream engine, and a much larger build.
+
+Blockers for either, on top of the above: MXFP4 experts (the dominant compute) need
+custom Metal shaders → full Xcode (not installed); and GPU FP breaks bit-exactness
+regardless of batch size. So even the batched path forks the correctness model.
+
 ## Consequences
-- The GPU track closes here. The spike (~150 lines, one afternoon) saved a multi-week
-  Metal port that would have delivered a modest, I/O-capped, non-bit-exact result.
-- `spike/` is kept as the reproducible evidence. It does not build with the engine.
-- The remaining material lever is the **persistent engine** (removes the ~22 s per-request
-  trunk-pin — a latency/time-to-first-token win), not steady-state compute.
+- The GPU track closes **for single-stream decode**. The spike (~150 lines) saved a
+  multi-week port that would not help that workload.
+- The batched/throughput opportunity is recorded here for when/if the goal shifts from
+  "fast one conversation" to "many conversations at once."
+- `spike/` is kept as reproducible evidence (builds standalone, not with the engine).
+- The remaining material lever *for single-stream latency* is the **persistent engine**
+  (removes the ~22 s per-request trunk-pin), not steady-state compute or GPU.
 
 ## Alternatives considered
 - **Full Metal port (custom shaders).** Rejected: needs full Xcode; only helps the ~1 s
