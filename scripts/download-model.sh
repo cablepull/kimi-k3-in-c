@@ -13,6 +13,13 @@
 
 set -euo pipefail
 
+# File size in bytes. GNU and BSD stat spell this differently, and BSD find has no
+# -printf, so every size read below goes through this one helper.
+case "$(uname -s)" in
+    Darwin) fsize() { stat -f%z "$1" 2>/dev/null || echo 0; } ;;
+    *)      fsize() { stat -c%s "$1" 2>/dev/null || echo 0; } ;;
+esac
+
 DEST="${1:?usage: download-model.sh <dest_dir>}"
 REPO="moonshotai/Kimi-K3"
 
@@ -111,7 +118,7 @@ echo "verifying…"
 # ls exit non-zero and the script dies HERE, so the "download is incomplete" message
 # below -- the entire point of this verification block -- would never be reached.
 N=$(find "$DEST" -maxdepth 1 -name '*.safetensors' | wc -l)
-B=$(find "$DEST" -maxdepth 1 -name '*.safetensors' -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+B=$(find "$DEST" -maxdepth 1 -name '*.safetensors' | while read -r f; do fsize "$f"; done | awk '{s+=$1} END{print s+0}')
 
 printf '  shards : %s (expect %s)\n' "$N" "$EXPECT_SHARDS"
 printf '  bytes  : %s (expect %s)\n' "$B" "$EXPECT_BYTES"
@@ -135,7 +142,7 @@ if [ -f "$SIZES" ]; then
     bad=0
     while read -r name want; do
         [ -n "$name" ] || continue
-        got=$(stat -c%s "$DEST/$name" 2>/dev/null || echo 0)
+        got=$(fsize "$DEST/$name")
         if [ "$got" != "$want" ]; then
             printf '  BAD  %s: %s bytes, expected %s\n' "$name" "$got" "$want"
             bad=$((bad + 1))

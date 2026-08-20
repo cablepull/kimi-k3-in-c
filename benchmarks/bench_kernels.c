@@ -128,6 +128,56 @@ int main(void)
         free(pk); free(sc); free(x); free(y);
     }
 
+    /* ---------- RMSNorm: hidden width (7168) and KDA head (16) ---------- */
+    /* Isolates the NEON vs scalar (auto-vectorised) question the full-model run cannot:
+     * RMSNorm runs on every norm in the model, and the NEON build activates the
+     * hand-written path in k3_ops.c. Two sizes because the call sites differ -- E=7168
+     * for the layer norms, D=16 per head inside KDA/MLA. */
+    {
+        for (int trial = 0; trial < 2; trial++) {
+            const int n = trial == 0 ? 7168 : 16;
+            float *x = malloc((size_t)n * sizeof(float));
+            float *w = malloc((size_t)n * sizeof(float));
+            float *y = malloc((size_t)n * sizeof(float));
+            if (!x || !w || !y) { printf("alloc failed\n"); return 1; }
+            fillf(x, n, 1); fillf(w, n, 2);
+            k3_rmsnorm(y, x, w, n, 1e-6f);            /* warm */
+            const int reps = n >= 4096 ? 20000 : 400000;
+            const double t0 = now_s();
+            for (int r = 0; r < reps; r++) k3_rmsnorm(y, x, w, n, 1e-6f);
+            const double dt = (now_s() - t0) / reps;
+            printf("rmsnorm n=%-5d  %8.1f ns/call\n", n, dt * 1e9);
+            fnv("rmsnorm", y, n);
+            free(x); free(w); free(y);
+        }
+    }
+
+    /* ---------- KDA recurrence step: the per-(head,token) D x D update ---------- */
+    /* Isolates the NEON vs scalar question for k3_kda_step. D = kda_head_dim = 16 at
+     * the released shape; the state S is D x D. Called kda_heads x 69 layers x tokens,
+     * so a few ns here is ~1 s/token across a run. */
+    {
+        const int D = 16;
+        float *S = malloc((size_t)D * D * sizeof(float));
+        float *o = malloc((size_t)D * sizeof(float));
+        float *q = malloc((size_t)D * sizeof(float));
+        float *k = malloc((size_t)D * sizeof(float));
+        float *v = malloc((size_t)D * sizeof(float));
+        float *al = malloc((size_t)D * sizeof(float));
+        if (!S || !o || !q || !k || !v || !al) { printf("alloc failed\n"); return 1; }
+        fillf(q, D, 3); fillf(k, D, 4); fillf(v, D, 5);
+        for (int i = 0; i < D; i++) al[i] = 0.9f + 0.1f * (float)i / D;   /* decay in (0,1) */
+        fillf(S, D * D, 6);
+        k3_kda_step(S, o, q, k, v, al, 0.5f, D, D);           /* warm */
+        const int reps = 2000000;
+        const double t0 = now_s();
+        for (int r = 0; r < reps; r++) k3_kda_step(S, o, q, k, v, al, 0.5f, D, D);
+        const double dt = (now_s() - t0) / reps;
+        printf("kda_step D=%-3d   %8.1f ns/call\n", D, dt * 1e9);
+        fnv("kda_o", o, D);
+        free(S); free(o); free(q); free(k); free(v); free(al);
+    }
+
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
     return 0;

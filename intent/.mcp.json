@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "magnetfragnet": {
+      "command": "magnetfragnet",
+      "args": ["mcp-stdio"],
+      "description": "Per-iteration nudge tool. Call nudge_iteration after each TDD red→green→refactor cycle."
+    }
+  }
+}

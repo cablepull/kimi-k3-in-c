@@ -330,6 +330,9 @@ static void usage(FILE *f)
 "\n"
 "generation:\n"
 "  --gen N               tokens to generate (default 8)\n"
+"  --stop-id N           halt after emitting token id N (repeatable, up to 8). The\n"
+"                        stop id is kept in the sequence, so --save-state and a later\n"
+"                        --load-state continue from what was actually produced\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
@@ -430,7 +433,47 @@ static double peak_rss_bytes(void)
 }
 
 /* MemAvailable, which is what the kernel thinks can actually be handed out, not
- * MemFree. Returns 0 if it cannot be read. */
+ * MemFree. Returns 0 if it cannot be read.
+ *
+ * PLATFORM. Linux exposes MemAvailable directly in /proc/meminfo. Darwin has no such
+ * file; the closest honest figure is what the kernel can hand out without swapping --
+ * free + inactive + speculative + purgeable pages, via the Mach VM statistics. It reads
+ * LOW on a busy machine (memory the OS could reclaim but has not yet), which errs toward
+ * a smaller preset -- the safe direction. mem_total_bytes() is the installed RAM. */
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+
+static double mem_total_bytes(void)
+{
+    int64_t v = 0; size_t len = sizeof v;
+    if (sysctlbyname("hw.memsize", &v, &len, NULL, 0) != 0) return 0.0;
+    return (double)v;
+}
+static double mem_available_bytes(void)
+{
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0.0;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0.0;
+    const uint64_t avail = (uint64_t)vm.free_count + vm.inactive_count
+                         + vm.speculative_count + vm.purgeable_count;
+    return (double)avail * (double)page;
+}
+#else
+static double mem_total_bytes(void)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.0;
+    char line[256];
+    double kb = 0.0;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "MemTotal:", 9)) { kb = atof(line + 9); break; }
+    fclose(f);
+    return kb * 1024.0;
+}
 static double mem_available_bytes(void)
 {
     FILE *f = fopen("/proc/meminfo", "r");
@@ -442,6 +485,7 @@ static double mem_available_bytes(void)
     fclose(f);
     return kb * 1024.0;
 }
+#endif
 
 typedef struct {
     K3LayerBind *lay;
@@ -578,8 +622,16 @@ int main(int argc, char **argv)
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
+    /* --stop-id, repeatable. Generation halts AFTER emitting a listed id, so the state
+     * written by --save-state still contains it and a later --load-state continues the
+     * sequence the model actually produced. Without this the engine always runs to
+     * --gen, which for a chat-tuned checkpoint means paying seconds per token for text
+     * past the end-of-message marker that a caller will only throw away. */
+    int stop_id[8]; int n_stop = 0, hit_stop = 0;
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
+    int dry_run = 0;   /* --dry-run: resolve + print the memory plan, allocate NOTHING */
+    double headroom_gb = 0.0;   /* --headroom-gb: override the macOS auto safety margin */
     int spec_n = 0;
     int tf_check = 0;
     const char *draft_dir = NULL;
@@ -594,6 +646,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) {
+            if (n_stop >= (int)(sizeof stop_id / sizeof stop_id[0])) {
+                fprintf(stderr, "--stop-id given more than %d times\n",
+                        (int)(sizeof stop_id / sizeof stop_id[0]));
+                return 2;
+            }
+            stop_id[n_stop++] = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
@@ -610,6 +670,8 @@ int main(int argc, char **argv)
             else { trunk_gb = atof(v); budget_auto = 0; }
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
+        else if (!strcmp(argv[i], "--headroom-gb") && i + 1 < argc) headroom_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -642,7 +704,7 @@ int main(int argc, char **argv)
     }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
-        if (nsrc == 0) {
+        if (nsrc == 0 && !dry_run) {   /* --dry-run only sizes memory; it needs no prompt */
             fprintf(stderr, "one of --ids, --prompt or --prompt-file is required\n");
             return 2;
         }
@@ -664,8 +726,8 @@ int main(int argc, char **argv)
     if (budget_auto) {
         const double avail = mem_available_bytes();
         if (avail <= 0.0) {
-            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
-                            "--trunk-gb/--cache-gb on this platform\n");
+            fprintf(stderr, "--preset auto could not read this machine's memory; pass "
+                            "explicit --trunk-gb/--cache-gb\n");
             return 2;
         }
         /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
@@ -673,6 +735,26 @@ int main(int argc, char **argv)
          * 2 GB + 2% margin so auto never invites the OOM killer. */
         const double reserve = 2.0 + 0.02 * (avail / 1e9) + 4.70 + 1.70;
         double usable = avail / 1e9 - reserve;
+#if defined(__APPLE__)
+        /* SAFETY CLAMP (macOS). Darwin reports reclaimable cache as "available", so
+         * sizing to it can push the resident set past physical RAM -- an aggressive auto
+         * config once drove a 128 GB Mac into a swap storm and a reboot. Bound the whole
+         * budget by TOTAL RAM minus a generous headroom (~28%, min 20 GB) for the OS,
+         * window server, and other apps. Speed is flat across the resulting trunk range,
+         * so the safe point costs ~nothing; explicit --trunk-gb still overrides. */
+        const double memtot_gb = mem_total_bytes() / 1e9;
+        if (memtot_gb > 0.0) {
+            /* Default headroom ~28% (min 20 GB). --headroom-gb N overrides it for a
+             * dedicated machine that can safely give the engine more -- tunable, but the
+             * conservative default is what protects an unattended run from the machine's
+             * own OS and apps. A too-small headroom is the exact mistake that rebooted a
+             * Mac, so refuse anything under 8 GB. */
+            double hold = memtot_gb * 0.28 > 20.0 ? memtot_gb * 0.28 : 20.0;
+            if (headroom_gb > 0.0) hold = headroom_gb < 8.0 ? 8.0 : headroom_gb;
+            const double safe_usable = memtot_gb - hold - reserve;
+            if (usable > safe_usable) usable = safe_usable;
+        }
+#endif
         const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
         const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
         if (usable < slot_min + cache_min) {
@@ -696,16 +778,16 @@ int main(int argc, char **argv)
              * mildly positive (40.1 s/token at 25 GB, device throughput unharmed).
              * So below full residency, auto pins only while the whole process stays
              * comfortably clear of the RAM ceiling. */
-            double memtotal = 0.0;
-            FILE *mf = fopen("/proc/meminfo", "r");
-            if (mf) {
-                char ln[256];
-                while (fgets(ln, sizeof ln, mf))
-                    if (!strncmp(ln, "MemTotal:", 9)) { memtotal = atof(ln + 9) * 1024.0; break; }
-                fclose(mf);
-            }
+            /* macOS is already bounded by the up-front safety clamp on `usable`, so its
+             * ceiling is simply `usable` here. Linux keeps its tuned 0.55 x MemTotal. */
+            const double memtotal = mem_total_bytes();
+#if defined(__APPLE__)
+            const double rss_ceiling = usable;
+#else
             const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9
                                                       : usable;   /* no /proc: keep old cap */
+#endif
+            (void)memtotal;
             double cap = rss_ceiling - reserve - cache_min;
             if (cap < slot_min) cap = slot_min;
             trunk_gb = usable - cache_min;
@@ -714,6 +796,37 @@ int main(int argc, char **argv)
         }
         printf("auto budget: %.1f GB available, %.1f GB reserved -> trunk %.1f GB / "
                "expert cache %.1f GB\n", avail / 1e9, reserve, trunk_gb, cache_gb);
+    }
+
+    /* --dry-run: the budgets are now fully resolved (auto-computed or explicit). Print
+     * the plan and a peak-RSS estimate, then exit BEFORE allocating a single byte. This
+     * is how the auto-tune tool inspects a config without ever risking a swap storm --
+     * the only safe way to check sizing on a machine whose resident set is ~100 GB. */
+    if (dry_run) {
+        const double total_gb = mem_total_bytes() / 1e9;
+        const double avail_gb = mem_available_bytes() / 1e9;
+        /* Fixed resident costs outside the two budgets: embed+lm_head 4.70, recurrent
+         * 0.63, safetensors index ~0.08, plus KV/scratch headroom. Matches the measured
+         * gap between (trunk+cache) and peak RSS. */
+        const double fixed = 4.70 + 0.63 + 0.08 + 1.0;
+        const double est_rss = trunk_gb + cache_gb + fixed;
+        printf("\n--dry-run memory plan (nothing allocated):\n");
+        printf("  machine        : %.1f GB total, %.1f GB available\n", total_gb, avail_gb);
+        printf("  trunk budget   : %.1f GB\n", trunk_gb);
+        printf("  expert cache   : %.1f GB\n", cache_gb);
+        printf("  est. peak RSS  : %.1f GB  (trunk + cache + %.1f GB fixed)\n", est_rss, fixed);
+        if (total_gb > 0.0) {
+            /* The machine swaps well BEFORE the resident set reaches physical RAM: the
+             * OS, window server, and apps also need memory. Measured on a 128 GiB Mac, a
+             * ~111 GB resident set (81% of the 137 GB the kernel reports) swapped hard
+             * enough to force a reboot. So flag danger at 78% and hard-warn at 85% -- not
+             * at 100%, which would call a machine-killing config "fine". */
+            const char *flag = "";
+            if      (est_rss > 0.85 * total_gb) flag = "  *** OVER SAFE RAM -- will swap ***";
+            else if (est_rss > 0.78 * total_gb) flag = "  ** tight -- risks swap under load **";
+            printf("  headroom       : %.1f GB below total%s\n", total_gb - est_rss, flag);
+        }
+        return 0;
     }
 
     /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
@@ -1190,7 +1303,20 @@ int main(int argc, char **argv)
      * figure against a single step would misstate the I/O share. */
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0;
-    for (int g = 0; nout < gen; g++) {
+    /* `nout < gen` drives generation; the `g == 0` disjunct additionally runs the
+     * incremental prefill once even when --gen 0, so the prompt's KV and recurrent
+     * state are computed and can be saved with ZERO generated tokens. That is what
+     * lets --gen 0 --save-state warm a reusable prefix (e.g. a chat system prompt)
+     * whose recurrent state is exact rather than one generated token past the end. */
+    int prof_base_nout = 0;   /* nout at the point the profile timers were reset */
+    for (int g = 0; nout < gen || (incremental && g == 0); g++) {
+        /* Steady-state profiling: zero the per-component walls after step 0 (the heavy
+         * one-time prefill) so the K3_PROFILE breakdown reflects single-token decode,
+         * not the prefill amortized across the run. */
+        if (g == 1 && getenv("K3_PROFILE")) {
+            k3_mla_wall = k3_kda_wall = k3_moe_wall = 0.0;
+            prof_base_nout = nout;
+        }
         k3_cache_reset_stats(&cache);
         const double ts = now_s();
         int frc;
@@ -1344,6 +1470,15 @@ int main(int argc, char **argv)
         for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
             seq[T++] = emit[i];
             outtok[nout++] = emit[i];
+            /* Checked here rather than per step so a speculative sweep that verifies
+             * past a stop id is truncated at the stop, exactly like serial decode. */
+            for (int s = 0; s < n_stop; s++)
+                if (emit[i] == stop_id[s]) { hit_stop = 1; break; }
+            if (hit_stop) break;
+        }
+        if (hit_stop) {
+            printf("stop id reached after %d tokens\n", nout);
+            break;
         }
         if (T >= Tmax) break;
     }
@@ -1378,7 +1513,30 @@ int main(int argc, char **argv)
     }
     free(spec_snap);
     printf("--------------------------------------------------------------------\n");
-    printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
+    if (nout > 0)
+        printf("%d tokens in %.1f s, %.2f s/token average\n",
+               nout, t_total, t_total / nout);
+    else
+        printf("prefill only: %d positions cached, 0 tokens generated\n", w.cached);
+
+    /* Per-component compute breakdown, when K3_PROFILE was set. Attention (MLA on the
+     * 24 latent-attention layers, KDA on the 69 recurrent ones) and the MoE/MLP are the
+     * kernels the trunk/expert I/O timers above do not separate. Divide by tokens for a
+     * per-token figure comparable to the s/token average. */
+    if (getenv("K3_PROFILE") && nout - prof_base_nout > 0) {
+        const int steady = nout - prof_base_nout;   /* steady tokens (prefill excluded) */
+        const double comp = k3_kda_wall + k3_mla_wall + k3_moe_wall;
+        printf("\ncompute breakdown (K3_PROFILE), STEADY decode over %d tokens "
+               "(prefill excluded):\n", steady);
+        printf("  KDA attention (69 layers): %7.1f s  (%.2f s/token)\n",
+               k3_kda_wall, k3_kda_wall / steady);
+        printf("  MLA attention (24 layers): %7.1f s  (%.2f s/token)\n",
+               k3_mla_wall, k3_mla_wall / steady);
+        printf("  MoE / MLP feed-forward   : %7.1f s  (%.2f s/token)\n",
+               k3_moe_wall, k3_moe_wall / steady);
+        printf("  ---- attention+MLP total : %7.1f s  (%.2f s/token)\n",
+               comp, comp / steady);
+    }
 
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so

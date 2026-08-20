@@ -1,0 +1,10 @@
+{
+  "name": "intent Architecture Audits",
+  "version": "1.0.0",
+  "description": "ACH-shaped architecture audits produced by nudge #9 via the intelligence-analyst skill.",
+  "discovery": {
+    "convention": "Each entry points to a directory containing metadata.json, hypotheses.json, evidence.json, sources.json. cablepull/ach-compatible.",
+    "supportedLanguages": ["en"]
+  },
+  "analyses": []
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://magnetfragnet.local/schema/v1/status.schema.json",
+  "title": "magnetfragnet status — machine-readable project visibility state (PRD F-19 R-6)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "wired",
+    "total_iterations",
+    "last_iteration_ts",
+    "audit",
+    "queued_skill_nudges",
+    "line"
+  ],
+  "properties": {
+    "wired": {
+      "type": "boolean",
+      "description": "false iff zero iteration records exist (the R-3 empty state)"
+    },
+    "total_iterations": { "type": "integer", "minimum": 0 },
+    "last_iteration_ts": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 timestamp of the most recent iteration record, or null when unwired"
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["counter", "threshold", "audits_completed"],
+      "properties": {
+        "counter": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "iterations since the last completed audit (ADR-010)"
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "audit_counter_N from magnetfragnet.config.json"
+        },
+        "audits_completed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "queued_skill_nudges": {
+      "type": "array",
+      "description": "Skill-bearing nudges currently owed (F-19 R-5)",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["nudge_id", "skill"],
+        "properties": {
+          "nudge_id": { "type": "string", "minLength": 1 },
+          "skill": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "line": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "The exact line the --line variant renders for this state"
+    }
+  }
+}

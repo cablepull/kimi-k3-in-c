@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://magnetfragnet.local/schema/v1/metadata.schema.json",
+  "title": "ACH analysis — metadata",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["id", "title", "analyticQuestion", "keyJudgment", "date"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "subtitle": { "type": "string" },
+    "version": { "type": "string" },
+    "date": { "type": "string", "minLength": 1 },
+    "analyst": { "type": "string" },
+    "analyticQuestion": { "type": "string", "minLength": 1 },
+    "keyJudgment": {
+      "type": "object",
+      "required": ["summary", "confidence"],
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "moderate", "moderate-to-high", "high", "very-high"]
+        }
+      }
+    },
+    "remainingGaps": { "type": "array", "items": { "type": "string" } },
+    "subDomains": { "type": "array" },
+    "inflectionPoints": { "type": "object" },
+    "triggerEvent": { "type": "array", "items": { "type": "string" } },
+    "iterationNumber": { "type": "number" }
+  }
+}

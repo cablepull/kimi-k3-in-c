@@ -44,6 +44,11 @@ UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     ARCH ?= -mcpu=native
+    # Turn on the hand-written NEON kernels (k3_ops.c #ifdef K3_ENABLE_ARM_NEON). They
+    # are held bit-exact to the scalar path (ADR-001): separate mul/add, no vfmaq, and
+    # -ffp-contract=off below preserves that. The CMake build sets the same define; keep
+    # them in step so `make` and `cmake` produce the same kernels.
+    CPPFLAGS += -DK3_ENABLE_ARM_NEON
   else
     ARCH ?= -march=native
   endif
@@ -84,6 +89,10 @@ WARN     := -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter
 # an OpenMP construct. It composes with the platform OpenMP flags above rather than
 # replacing them: Apple Clang needs -Xpreprocessor -fopenmp AND -pthread.
 CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) $(OMP_CFLAGS) -pthread -ffp-contract=off
+# $(CPPFLAGS) carries preprocessor -D defines (e.g. -DK3_ENABLE_ARM_NEON on arm64).
+# The compile recipe uses $(CFLAGS), not $(CPPFLAGS), so fold it in here or the define
+# is silently dropped and the scalar path (auto-vectorised by the compiler) is built.
+CFLAGS   += $(CPPFLAGS)
 LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc

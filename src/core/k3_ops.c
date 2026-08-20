@@ -30,6 +30,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Per-component decode profiling (opt-in). Accumulated across every layer of every
+ * token so the CLI can attribute the per-token wall clock: attention (MLA/KDA), MoE,
+ * and the norm/residual glue. Layers run serially (each feeds the next), so these
+ * plain globals are updated on one thread; the kernels parallelise internally, and
+ * the timer brackets the whole parallel call. Zero cost when K3_PROFILE is unset. */
+double k3_mla_wall = 0.0, k3_kda_wall = 0.0, k3_moe_wall = 0.0, k3_glue_wall = 0.0;
+static int k3_profile_on = -1;
+static inline double k3_now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static inline int k3_profiling(void)
+{
+    if (k3_profile_on < 0) k3_profile_on = getenv("K3_PROFILE") ? 1 : 0;
+    return k3_profile_on;
+}
+#define K3_PROF_T0()  (k3_profiling() ? k3_now_s() : 0.0)
+#define K3_PROF_ADD(acc, t0) do { if (k3_profiling()) (acc) += k3_now_s() - (t0); } while (0)
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -88,6 +110,15 @@ int k3_is_kda(const K3Cfg *c, int layer)   { return !k3_is_mla(c, layer); }
 int k3_is_dense(const K3Cfg *c, int layer) { return layer < c->first_dense; }
 
 /* --------------------------------------------------------------- rmsnorm ---- */
+#ifdef K3_ENABLE_ARM_NEON
+#include <arm_neon.h>   /* used by the KDA recurrence kernel further down */
+#endif
+
+/* Scalar RMSNorm. A hand-written NEON version existed and was REMOVED (ADR-004):
+ * bench_kernels measured it bit-identical (same FNV1a) but ~14% SLOWER at n=7168 --
+ * its per-lane vgetq_lane_f32 reductions serialise on ARM, and the compiler already
+ * auto-vectorises this loop under -mcpu=native. Keeping the reduction in a scalar
+ * double also holds the summation order the reference depends on. */
 void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
 {
     /* double accumulator: 7168 squared terms in float32 loses real precision, and
@@ -187,19 +218,66 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
+    /* 2. read the state along k:  u = S^T k
+     * The temporary u was a calloc(dv) on EVERY call -- H*layers*tokens allocations,
+     * inside an OpenMP-parallel region (allocator-lock contention). dv is tiny
+     * (kda_head_dim, 16 at the released shape), so a stack buffer removes the malloc
+     * entirely; the calloc path survives only for a hypothetical oversized dv. */
+    enum { K3_KDA_USTACK = 256 };
+    float ustack[K3_KDA_USTACK];
+    float *u = (dv <= K3_KDA_USTACK) ? ustack
+                                     : (float *)calloc((size_t)dv, sizeof(float));
     if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+
+    /* Steps 2-4 vectorise the INNER j loop only. The reductions in 2 and 4 accumulate
+     * across the OUTER i loop into u[j]/o[j], so the summation order is untouched and
+     * the result is bit-identical to the scalar path. Multiply and add are kept
+     * SEPARATE (vmulq then vaddq, never vfmaq) to match -ffp-contract=off: a fused
+     * multiply-add rounds once and would diverge from the reference. */
+#ifdef K3_ENABLE_ARM_NEON
+    for (int i = 0; i < dk; i++) {
+        const float ki = k[i];
+        if (ki == 0.0f) continue;
+        const float *row = S + (size_t)i * dv;
+        const float32x4_t vki = vdupq_n_f32(ki);
+        int j = 0;
+        for (; j + 4 <= dv; j += 4)
+            vst1q_f32(u + j, vaddq_f32(vld1q_f32(u + j),
+                                       vmulq_f32(vki, vld1q_f32(row + j))));
+        for (; j < dv; j++) u[j] += ki * row[j];
+    }
+    for (int i = 0; i < dk; i++) {
+        const float ki = k[i];
+        if (ki == 0.0f) continue;
+        float *row = S + (size_t)i * dv;
+        const float kb = ki * beta;              /* scalar order: (ki*beta)*(v-u) */
+        const float32x4_t vkb = vdupq_n_f32(kb);
+        int j = 0;
+        for (; j + 4 <= dv; j += 4)
+            vst1q_f32(row + j, vaddq_f32(vld1q_f32(row + j),
+                          vmulq_f32(vkb, vsubq_f32(vld1q_f32(v + j), vld1q_f32(u + j)))));
+        for (; j < dv; j++) row[j] += kb * (v[j] - u[j]);
+    }
+    for (int j = 0; j < dv; j++) o[j] = 0.0f;
+    for (int i = 0; i < dk; i++) {
+        const float qi = q[i];
+        if (qi == 0.0f) continue;
+        const float *row = S + (size_t)i * dv;
+        const float32x4_t vqi = vdupq_n_f32(qi);
+        int j = 0;
+        for (; j + 4 <= dv; j += 4)
+            vst1q_f32(o + j, vaddq_f32(vld1q_f32(o + j),
+                                       vmulq_f32(vqi, vld1q_f32(row + j))));
+        for (; j < dv; j++) o[j] += qi * row[j];
+    }
+#else
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
-
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
      *    it a DELTA rule rather than plain accumulation. */
     for (int i = 0; i < dk; i++) {
@@ -208,7 +286,6 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
     }
-
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
@@ -217,7 +294,8 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
-    free(u);
+#endif
+    if (u != ustack) free(u);
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
@@ -974,8 +1052,13 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
-    if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
-    else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+    {
+        const double t0 = K3_PROF_T0();
+        if (w->kda) { k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
+                      K3_PROF_ADD(k3_kda_wall, t0); }
+        else        { k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+                      K3_PROF_ADD(k3_mla_wall, t0); }
+    }
 
     if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
@@ -994,6 +1077,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->post_norm, E, c->rms_eps);
 
+    const double t0_mlp = K3_PROF_T0();
     if (w->moe) {
         int   idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
         /* Prefill batches (T > 1, streamed source) fetch each unique expert once for
@@ -1010,6 +1094,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
         }
     }
 
+    K3_PROF_ADD(k3_moe_wall, t0_mlp);
     for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     memcpy(h, pref, (size_t)T * E * sizeof(float));
 }

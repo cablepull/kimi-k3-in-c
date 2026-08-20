@@ -45,10 +45,15 @@ static inline int posix_fadvise(int fd, off_t off, off_t len, int advice)
 }
 
 /* Darwin's O_DIRECT equivalent, applied after open(). Failure is not fatal: the caller
- * keeps the descriptor and reads through the page cache instead. */
+ * keeps the descriptor and reads through the page cache instead. K3_BUFFERED=1 skips
+ * the fcntl entirely: on a machine whose RAM exceeds the working set, letting the page
+ * cache absorb trunk and expert reads can beat uncached I/O, and the env var makes that
+ * an A/B on one binary rather than a comparison of two builds. */
+#include <stdlib.h>
 static inline int k3_set_direct(int fd)
 {
     if (fd < 0) return -1;
+    if (getenv("K3_BUFFERED")) return 0;
     return fcntl(fd, F_NOCACHE, 1);
 }
 
@@ -57,5 +62,12 @@ static inline int k3_set_direct(int fd)
 static inline int k3_set_direct(int fd) { (void)fd; return 0; }
 
 #endif
+
+/* Largest request a single pread() may carry. Linux silently truncates bigger requests
+ * to 0x7ffff000 bytes and returns short, which the retry loops absorb; Darwin instead
+ * REJECTS anything over INT_MAX with EINVAL, and a -1 is indistinguishable from a real
+ * error inside those loops. One clamp below the smaller of the two limits serves both.
+ * Only the embedding table (2.35 GB at the released shape) ever exceeds it. */
+#define K3_PREAD_MAX ((int64_t)1 << 30)
 
 #endif /* K3_PORTABLE_IO_H */
