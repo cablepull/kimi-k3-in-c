@@ -63,3 +63,5 @@ build-macos-arm/
 complexity_baseline.json
 quality_baseline.json
 .cache/
+spike/metal_probe
+spike/mps_matmul
