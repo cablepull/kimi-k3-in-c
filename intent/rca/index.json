@@ -1,0 +1,10 @@
+{
+  "name": "intent RCA corpus",
+  "version": "1.0.0",
+  "description": "Root Cause Analyses. ACH-shaped per nudge #4 for disputed incidents; lightweight Markdown for trivial ones.",
+  "discovery": {
+    "convention": "ACH-shaped RCAs live under rca/<id>/ with the 4 JSON files. Lightweight RCAs are flat: rca/NNN-kebab-case.md.",
+    "supportedLanguages": ["en"]
+  },
+  "analyses": []
+}

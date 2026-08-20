@@ -1,0 +1,33 @@
+{
+  "$comment": "Project config. Defaults applied per src/config/load.ts when keys are missing. Tune to taste.",
+  "thresholds": {
+    "audit_loc_threshold": 250,
+    "audit_files_threshold": 8,
+    "audit_counter_N": 5,
+    "distance_saturation": 5,
+    "max_cyclomatic_complexity": 10,
+    "max_nesting_depth": 4,
+    "max_function_length": 50,
+    "mutation_min_score": 70,
+    "mutation_max_drop_pct": 5,
+    "max_decision_density": 12,
+    "max_findings_per_detector": 5,
+    "engine_latency_budget_ms": 150
+  },
+  "weights": {
+    "nudge-9-architecture-audit": 2.0
+  },
+  "blocking": [],
+  "mutation": {
+    "reports": [],
+    "exempt_globs": [
+      "**/ui/**",
+      "**/views/**",
+      "**/screens/**",
+      "**/components/**",
+      "**/layouts/**",
+      "**/*.stories.*",
+      "**/storybook/**"
+    ]
+  }
+}
