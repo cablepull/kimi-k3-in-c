@@ -519,6 +519,12 @@ void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             int T, float *state, float *scratch,
                             float *kvc, float *ropec, int cached, int cap);
 
+/* Per-component decode profiling. Accumulated across all layers/tokens while
+ * K3_PROFILE is set in the environment; zero otherwise. Attention is MLA (24 layers)
+ * or KDA (69 layers); MoE/MLP is the expert or dense feed-forward. Lets the CLI
+ * attribute the per-token wall clock. */
+extern double k3_mla_wall, k3_kda_wall, k3_moe_wall, k3_glue_wall;
+
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.
  *
