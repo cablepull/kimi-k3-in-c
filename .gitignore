@@ -63,3 +63,4 @@ build-macos-arm/
 complexity_baseline.json
 quality_baseline.json
 .cache/
+.magnetfragnet/
