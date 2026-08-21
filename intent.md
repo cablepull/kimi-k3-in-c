@@ -56,6 +56,25 @@ s/token) beats the proxy (D-1, SIMD %) when they disagree.
 | S-6 | Thread pinning (`OMP_PROC_BIND`/`OMP_PLACES`) | doc-only | washes out end-to-end; document in docs/MACOS.md, not a build story |
 | S-5 | NEON RMSNorm / ShortConv / elementwise | opportunistic | RMSNorm NEON already landed (bit-exact); rest only if P1 shows they matter |
 
+### Path 2 — batched GPU throughput server (branch `gpu-batched-server`)
+
+`because` ADR-006 measured GPU at 10–200× for GEMM (M≥16) while ~parity for single-token
+decode: throughput (many concurrent requests / heavy prefill), not single-stream latency, is
+where GPU pays. Driven by the loop in `intent/loops/gpu-throughput.md`. Abandons
+bit-exactness for the GPU path (explicit correctness-regime change) while the CPU
+single-stream path stays byte-identical.
+
+| ID | Story | Priority | Status |
+|----|-------|----------|--------|
+| S-P2-1 | ADR: batched-server architecture + tolerance-based correctness regime | P1 | TODO |
+| S-P2-2 | Prereq gate: detect Xcode/metal compiler; MPS-only vs full-shader plan | P1 | TODO |
+| S-P2-3 | Batched decode harness — run M token-streams through the decoder together | P2 | TODO |
+| S-P2-4 | GPU bf16 trunk GEMM via MPS, resident weights, tolerance test | P2 | TODO |
+| S-P2-5 | MXFP4 expert dequant + GEMM custom Metal shader (needs full Xcode) | P3 | TODO — gated on Xcode |
+| S-P2-6 | Dynamic request batching / scheduler (merge concurrent decode steps) | P3 | TODO |
+| S-P2-7 | Tolerance validation harness (replaces exact-token oracle for the GPU path) | P2 | TODO |
+| S-P2-8 | Throughput benchmark: tokens/sec vs batch vs CPU single-stream | P3 | TODO |
+
 ## Design Decisions (ADR-001 .. ADR-NNN)
 
 See `adr/` for individual design decisions.
